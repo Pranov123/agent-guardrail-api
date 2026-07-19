@@ -2,6 +2,7 @@ import os
 import re
 import socket
 import ipaddress
+import string
 from urllib.parse import urlparse
 
 import requests
@@ -100,7 +101,22 @@ def check_read_file(path):
 PRIVATE_HOST_PATTERNS = [
     re.compile(r"^localhost$", re.I),
     re.compile(r"\.local$", re.I),
+    re.compile(r"\.localdomain$", re.I),
+    re.compile(r"\.internal$", re.I),
 ]
+
+# any char <= 0x20 (control chars, space, tab, CR, LF) or DEL is disallowed anywhere in the raw URL
+_BAD_CHARS = set(chr(c) for c in range(0x21)) | {chr(0x7f)}
+
+
+def _has_bad_chars(s: str) -> bool:
+    return any(c in _BAD_CHARS for c in s)
+
+
+def normalize_host(host: str) -> str:
+    """Single source of truth for host normalization, used for both allowlist
+    checks and DNS resolution so the two can never disagree."""
+    return host.strip().lower().rstrip(".")
 
 
 def _is_public_ip(ip_str: str) -> bool:
@@ -109,9 +125,13 @@ def _is_public_ip(ip_str: str) -> bool:
     except ValueError:
         return False
 
-    # Unwrap IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) and check the real v4 address
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
+    # Unwrap IPv4-mapped / IPv4-compatible IPv6 addresses before judging
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            ip = mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
 
     if ip.is_private or ip.is_loopback or ip.is_link_local:
         return False
@@ -133,64 +153,83 @@ def _resolve_all_ips(host: str):
         return None
 
 
-def _validate_host(host: str):
+def _validate_host(raw_host: str):
     try:
-        host = host.lower().rstrip(".")
+        host = normalize_host(raw_host)
     except Exception:
-        return False, "invalid host"
+        return False, "invalid host", None
+
+    if not host or _has_bad_chars(host):
+        return False, "invalid characters in host", None
+
     if host not in ALLOWED_HOSTS:
-        return False, f"host '{host}' not in allowlist"
+        return False, f"host '{host}' not in allowlist", None
+
     for pat in PRIVATE_HOST_PATTERNS:
         if pat.search(host):
-            return False, "blocked host pattern"
+            return False, "blocked host pattern", None
+
     ips = _resolve_all_ips(host)
     if not ips:
-        return False, "could not resolve host"
+        return False, "could not resolve host", None
+
+    public_ips = []
     for ip in ips:
         if not _is_public_ip(ip):
-            return False, f"host resolves to non-public address ({ip})"
-    return True, "ok"
+            return False, f"host resolves to non-public address ({ip})", None
+        public_ips.append(ip)
+
+    return True, "ok", public_ips
 
 
 def check_fetch_url(url):
     try:
         if not isinstance(url, str) or url == "":
-            return False, "empty or invalid url", None
+            return False, "empty or invalid url", None, None
+
+        if _has_bad_chars(url):
+            return False, "control/whitespace characters in url", None, None
 
         try:
             parsed = urlparse(url)
         except Exception:
-            return False, "unparseable url", None
+            return False, "unparseable url", None, None
 
         scheme = (parsed.scheme or "").lower()
         if scheme not in ("http", "https"):
-            return False, "disallowed scheme", None
+            return False, "disallowed scheme", None, None
 
         if "@" in (parsed.netloc or ""):
-            return False, "userinfo in url not allowed", None
+            return False, "userinfo in url not allowed", None, None
 
         try:
             host = parsed.hostname
         except Exception:
-            return False, "malformed host / could not parse hostname", None
+            return False, "malformed host / could not parse hostname", None, None
 
         if not host:
-            return False, "no host in url", None
+            return False, "no host in url", None, None
 
-        ok, reason = _validate_host(host)
+        try:
+            port = parsed.port
+        except Exception:
+            return False, "malformed port", None, None
+
+        ok, reason, public_ips = _validate_host(host)
         if not ok:
-            return False, reason, None
+            return False, reason, None, None
 
-        return True, "ok", parsed
+        return True, "ok", parsed, public_ips
     except Exception as e:
-        return False, f"url validation error: {e}", None
+        return False, f"url validation error: {e}", None, None
 
 
 def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
     orig = socket.getaddrinfo
+    target = normalize_host(pinned_host)
 
     def pinned(host, port, family=0, type=0, proto=0, flags=0):
-        if host == pinned_host:
+        if normalize_host(str(host)) == target:
             results = []
             for ip in pinned_ips:
                 ipobj = ipaddress.ip_address(ip)
@@ -208,17 +247,11 @@ def safe_fetch(url: str, max_redirects: int = 5):
     try:
         current = url
         for _ in range(max_redirects):
-            ok, reason, parsed = check_fetch_url(current)
+            ok, reason, parsed, public_ips = check_fetch_url(current)
             if not ok:
                 return False, f"redirect target blocked: {reason}", None
 
             host = parsed.hostname
-            ips = _resolve_all_ips(host)
-            if not ips:
-                return False, "could not resolve host", None
-            public_ips = [ip for ip in ips if _is_public_ip(ip)]
-            if not public_ips:
-                return False, "host resolves to non-public address", None
 
             orig_getaddrinfo = socket.getaddrinfo
             socket.getaddrinfo = _make_pinned_getaddrinfo(host, public_ips)
@@ -231,12 +264,19 @@ def safe_fetch(url: str, max_redirects: int = 5):
                 location = resp.headers.get("Location")
                 if not location:
                     return False, "redirect with no location", None
+                if _has_bad_chars(location):
+                    return False, "redirect location has invalid characters", None
                 if location.startswith("//"):
                     p = urlparse(current)
                     location = f"{p.scheme}:{location}"
                 elif location.startswith("/"):
                     p = urlparse(current)
                     location = f"{p.scheme}://{p.netloc}{location}"
+                elif "://" not in location:
+                    # relative redirect (no scheme, no leading slash) - resolve against current
+                    p = urlparse(current)
+                    base_path = p.path.rsplit("/", 1)[0]
+                    location = f"{p.scheme}://{p.netloc}{base_path}/{location}"
                 current = location
                 continue
             return True, "ok", resp
@@ -272,7 +312,7 @@ async def guardrail(request: Request):
 
         elif tool == "fetch_url":
             url = args.get("url")
-            ok, reason, _ = check_fetch_url(url)
+            ok, reason, _, _ips = check_fetch_url(url)
             if not ok:
                 return JSONResponse({"action": "block", "reason": reason})
             ok2, reason2, resp = safe_fetch(url)
@@ -286,7 +326,6 @@ async def guardrail(request: Request):
 
         return JSONResponse({"action": "block", "reason": "unknown tool"})
     except Exception as e:
-        # Fail closed: any unexpected error blocks, never crashes/500s
         return JSONResponse({"action": "block", "reason": f"internal error: {e}"})
 
 
