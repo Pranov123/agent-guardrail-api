@@ -287,8 +287,7 @@ def safe_fetch(url: str, max_redirects: int = 5):
 
 # ---------- endpoint ----------
 
-@app.post("/")
-async def guardrail(request: Request):
+async def handle_guardrail(request: Request):
     try:
         try:
             body = await request.json()
@@ -327,6 +326,16 @@ async def guardrail(request: Request):
         return JSONResponse({"action": "block", "reason": "unknown tool"})
     except Exception as e:
         return JSONResponse({"action": "block", "reason": f"internal error: {e}"})
+
+
+@app.post("/")
+async def guardrail_root(request: Request):
+    return await handle_guardrail(request)
+
+
+@app.post("/check")
+async def guardrail_check(request: Request):
+    return await handle_guardrail(request)
 
 
 @app.get("/")
