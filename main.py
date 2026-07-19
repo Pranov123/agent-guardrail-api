@@ -196,8 +196,8 @@ def check_fetch_url(url):
             return False, "unparseable url", None, None
 
         scheme = (parsed.scheme or "").lower()
-        if scheme not in ("http", "https"):
-            return False, "disallowed scheme", None, None
+        if scheme != "https":
+            return False, "only https scheme is allowed", None, None
 
         if "@" in (parsed.netloc or ""):
             return False, "userinfo in url not allowed", None, None
