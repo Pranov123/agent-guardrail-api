@@ -24,6 +24,7 @@ ALLOWED_HOSTS = {"example.com", "www.iana.org"}
 CANARY = "AGENT_GUARDRAIL_CANARY_8fecfd61d8149c13d22a52801d83eb0302bf3a2d"
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -159,13 +160,46 @@ def check_fetch_url(url: str):
     return True, "ok", parsed
 
 
+def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
+    orig = socket.getaddrinfo
+
+    def pinned(host, port, family=0, type=0, proto=0, flags=0):
+        if host == pinned_host:
+            results = []
+            for ip in pinned_ips:
+                ipobj = ipaddress.ip_address(ip)
+                if ipobj.version == 6:
+                    results.append((socket.AF_INET6, socket.SOCK_STREAM, 6, '', (ip, port, 0, 0)))
+                else:
+                    results.append((socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, port)))
+            return results
+        return orig(host, port, family, type, proto, flags)
+
+    return pinned
+
+
 def safe_fetch(url: str, max_redirects: int = 5):
     current = url
     for _ in range(max_redirects):
         ok, reason, parsed = check_fetch_url(current)
         if not ok:
             return False, f"redirect target blocked: {reason}", None
-        resp = requests.get(current, allow_redirects=False, timeout=8)
+
+        host = parsed.hostname
+        ips = _resolve_all_ips(host)
+        if not ips:
+            return False, "could not resolve host", None
+        public_ips = [ip for ip in ips if _is_public_ip(ip)]
+        if not public_ips:
+            return False, "host resolves to non-public address", None
+
+        orig_getaddrinfo = socket.getaddrinfo
+        socket.getaddrinfo = _make_pinned_getaddrinfo(host, public_ips)
+        try:
+            resp = requests.get(current, allow_redirects=False, timeout=8)
+        finally:
+            socket.getaddrinfo = orig_getaddrinfo
+
         if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location")
             if not location:
