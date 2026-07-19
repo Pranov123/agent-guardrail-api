@@ -150,7 +150,14 @@ def _resolve_all_ips(host: str):
     except Exception:
         return None
     try:
-        return {info[4][0] for info in infos}
+        ips = []
+        seen = set()
+        for info in infos:
+            ip = info[4][0]
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        return ips
     except Exception:
         return None
 
@@ -181,8 +188,14 @@ def _validate_host(raw_host: str):
             return False, f"host resolves to non-public address ({ip})", None
         public_ips.append(ip)
 
-    return True, "ok", public_ips
+    if not public_ips:
+        return False, "no public address for host", None
 
+    # Prefer IPv4 first - some egress environments have unreliable IPv6,
+    # and set/dict ordering elsewhere shouldn't matter, so make it explicit.
+    public_ips.sort(key=lambda ip: ipaddress.ip_address(ip).version)
+
+    return True, "ok", public_ips
 
 def check_fetch_url(url):
     try:
@@ -255,12 +268,24 @@ def safe_fetch(url: str, max_redirects: int = 5):
 
             host = parsed.hostname
 
-            orig_getaddrinfo = socket.getaddrinfo
-            socket.getaddrinfo = _make_pinned_getaddrinfo(host, public_ips)
-            try:
-                resp = requests.get(current, allow_redirects=False, timeout=8)
-            finally:
-                socket.getaddrinfo = orig_getaddrinfo
+            resp = None
+            last_err = None
+            for ip in public_ips:
+                orig_getaddrinfo = socket.getaddrinfo
+                socket.getaddrinfo = _make_pinned_getaddrinfo(host, [ip])
+                try:
+                    resp = requests.get(current, allow_redirects=False, timeout=8)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    resp = None
+                    continue
+                finally:
+                    socket.getaddrinfo = orig_getaddrinfo
+
+            if resp is None:
+                return False, f"could not connect to any resolved address: {last_err}", None
 
             if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location")
@@ -284,8 +309,6 @@ def safe_fetch(url: str, max_redirects: int = 5):
         return False, "too many redirects", None
     except Exception as e:
         return False, f"fetch error: {e}", None
-
-
 # ---------- endpoint ----------
 
 async def handle_guardrail(request: Request):
