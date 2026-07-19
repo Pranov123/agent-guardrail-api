@@ -196,8 +196,8 @@ def check_fetch_url(url):
             return False, "unparseable url", None, None
 
         scheme = (parsed.scheme or "").lower()
-        if scheme != "https":
-            return False, "only https scheme is allowed", None, None
+        if scheme not in ("http", "https"):
+            return False, "only http/https schemes are allowed", None, None
 
         if "@" in (parsed.netloc or ""):
             return False, "userinfo in url not allowed", None, None
@@ -241,6 +241,14 @@ def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
         return orig(host, port, family, type, proto, flags)
 
     return pinned
+def _upgrade_to_https(url: str) -> str:
+    try:
+        p = urlparse(url)
+        if p.scheme.lower() == "http":
+            return "https://" + url.split("://", 1)[1]
+    except Exception:
+        pass
+    return url
 
 
 def safe_fetch(url: str, max_redirects: int = 5):
@@ -277,7 +285,7 @@ def safe_fetch(url: str, max_redirects: int = 5):
                     p = urlparse(current)
                     base_path = p.path.rsplit("/", 1)[0]
                     location = f"{p.scheme}://{p.netloc}{base_path}/{location}"
-                current = location
+                current = _upgrade_to_https(location)
                 continue
             return True, "ok", resp
         return False, "too many redirects", None
