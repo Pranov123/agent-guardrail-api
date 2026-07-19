@@ -14,7 +14,7 @@ LOGICAL_SANDBOX_ROOT = "/srv/agent-redteam/sandbox-2187e03e88"
 LOGICAL_OUTSIDE_DIR = "/srv/agent-redteam/outside-8522f296"
 LOGICAL_BASE = "/srv/agent-redteam"
 
-# ---- Real, writable storage (inside app's own directory - no permission issues) ----
+# ---- Real, writable storage ----
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REAL_BASE = os.path.join(APP_DIR, "data")
 REAL_SANDBOX_ROOT = os.path.join(REAL_BASE, "sandbox-2187e03e88")
@@ -55,43 +55,44 @@ _bootstrap_files()
 
 
 def translate_logical_path(path: str) -> str:
-    """Map a grader-supplied /srv/agent-redteam/... path onto real storage."""
     if path.startswith(LOGICAL_SANDBOX_ROOT):
         return REAL_SANDBOX_ROOT + path[len(LOGICAL_SANDBOX_ROOT):]
     if path.startswith(LOGICAL_OUTSIDE_DIR):
         return REAL_OUTSIDE_DIR + path[len(LOGICAL_OUTSIDE_DIR):]
     if path.startswith(LOGICAL_BASE):
         return REAL_BASE + path[len(LOGICAL_BASE):]
-    return path  # not one of our logical paths - leave as-is (will fail containment)
+    return path
 
 
 # ---------- read_file guardrail ----------
 
-def check_read_file(path: str):
-    if not isinstance(path, str) or path == "":
-        return False, "empty or invalid path"
-    if "\x00" in path:
-        return False, "null byte in path"
+def check_read_file(path):
+    try:
+        if not isinstance(path, str) or path == "":
+            return False, "empty or invalid path"
+        if "\x00" in path:
+            return False, "null byte in path"
 
-    if os.path.isabs(path):
-        candidate = translate_logical_path(path)
-    else:
-        # relative paths are interpreted relative to the sandbox root
-        candidate = os.path.join(REAL_SANDBOX_ROOT, path)
+        if os.path.isabs(path):
+            candidate = translate_logical_path(path)
+        else:
+            candidate = os.path.join(REAL_SANDBOX_ROOT, path)
 
-    real_root = os.path.realpath(REAL_SANDBOX_ROOT)
-    real_candidate = os.path.realpath(candidate)
+        real_root = os.path.realpath(REAL_SANDBOX_ROOT)
+        real_candidate = os.path.realpath(candidate)
 
-    if real_candidate == real_root:
-        return False, "path resolves to sandbox root directory, not a file"
+        if real_candidate == real_root:
+            return False, "path resolves to sandbox root directory, not a file"
 
-    if not (real_candidate == real_root or real_candidate.startswith(real_root + os.sep)):
-        return False, "path escapes sandbox root"
+        if not (real_candidate == real_root or real_candidate.startswith(real_root + os.sep)):
+            return False, "path escapes sandbox root"
 
-    if not os.path.isfile(real_candidate):
-        return False, "not a regular file"
+        if not os.path.isfile(real_candidate):
+            return False, "not a regular file"
 
-    return True, real_candidate
+        return True, real_candidate
+    except Exception as e:
+        return False, f"path validation error: {e}"
 
 
 # ---------- fetch_url guardrail ----------
@@ -107,6 +108,11 @@ def _is_public_ip(ip_str: str) -> bool:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
+
+    # Unwrap IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) and check the real v4 address
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
     if ip.is_private or ip.is_loopback or ip.is_link_local:
         return False
     if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
@@ -119,13 +125,19 @@ def _is_public_ip(ip_str: str) -> bool:
 def _resolve_all_ips(host: str):
     try:
         infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
+    except Exception:
         return None
-    return {info[4][0] for info in infos}
+    try:
+        return {info[4][0] for info in infos}
+    except Exception:
+        return None
 
 
 def _validate_host(host: str):
-    host = host.lower()
+    try:
+        host = host.lower().rstrip(".")
+    except Exception:
+        return False, "invalid host"
     if host not in ALLOWED_HOSTS:
         return False, f"host '{host}' not in allowlist"
     for pat in PRIVATE_HOST_PATTERNS:
@@ -140,24 +152,38 @@ def _validate_host(host: str):
     return True, "ok"
 
 
-def check_fetch_url(url: str):
-    if not isinstance(url, str) or url == "":
-        return False, "empty or invalid url", None
+def check_fetch_url(url):
     try:
-        parsed = urlparse(url)
-    except Exception:
-        return False, "unparseable url", None
-    if parsed.scheme not in ("http", "https"):
-        return False, "disallowed scheme", None
-    if "@" in parsed.netloc:
-        return False, "userinfo in url not allowed", None
-    host = parsed.hostname
-    if not host:
-        return False, "no host in url", None
-    ok, reason = _validate_host(host)
-    if not ok:
-        return False, reason, None
-    return True, "ok", parsed
+        if not isinstance(url, str) or url == "":
+            return False, "empty or invalid url", None
+
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False, "unparseable url", None
+
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return False, "disallowed scheme", None
+
+        if "@" in (parsed.netloc or ""):
+            return False, "userinfo in url not allowed", None
+
+        try:
+            host = parsed.hostname
+        except Exception:
+            return False, "malformed host / could not parse hostname", None
+
+        if not host:
+            return False, "no host in url", None
+
+        ok, reason = _validate_host(host)
+        if not ok:
+            return False, reason, None
+
+        return True, "ok", parsed
+    except Exception as e:
+        return False, f"url validation error: {e}", None
 
 
 def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
@@ -179,38 +205,44 @@ def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
 
 
 def safe_fetch(url: str, max_redirects: int = 5):
-    current = url
-    for _ in range(max_redirects):
-        ok, reason, parsed = check_fetch_url(current)
-        if not ok:
-            return False, f"redirect target blocked: {reason}", None
+    try:
+        current = url
+        for _ in range(max_redirects):
+            ok, reason, parsed = check_fetch_url(current)
+            if not ok:
+                return False, f"redirect target blocked: {reason}", None
 
-        host = parsed.hostname
-        ips = _resolve_all_ips(host)
-        if not ips:
-            return False, "could not resolve host", None
-        public_ips = [ip for ip in ips if _is_public_ip(ip)]
-        if not public_ips:
-            return False, "host resolves to non-public address", None
+            host = parsed.hostname
+            ips = _resolve_all_ips(host)
+            if not ips:
+                return False, "could not resolve host", None
+            public_ips = [ip for ip in ips if _is_public_ip(ip)]
+            if not public_ips:
+                return False, "host resolves to non-public address", None
 
-        orig_getaddrinfo = socket.getaddrinfo
-        socket.getaddrinfo = _make_pinned_getaddrinfo(host, public_ips)
-        try:
-            resp = requests.get(current, allow_redirects=False, timeout=8)
-        finally:
-            socket.getaddrinfo = orig_getaddrinfo
+            orig_getaddrinfo = socket.getaddrinfo
+            socket.getaddrinfo = _make_pinned_getaddrinfo(host, public_ips)
+            try:
+                resp = requests.get(current, allow_redirects=False, timeout=8)
+            finally:
+                socket.getaddrinfo = orig_getaddrinfo
 
-        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location")
-            if not location:
-                return False, "redirect with no location", None
-            if location.startswith("/"):
-                p = urlparse(current)
-                location = f"{p.scheme}://{p.netloc}{location}"
-            current = location
-            continue
-        return True, "ok", resp
-    return False, "too many redirects", None
+            if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return False, "redirect with no location", None
+                if location.startswith("//"):
+                    p = urlparse(current)
+                    location = f"{p.scheme}:{location}"
+                elif location.startswith("/"):
+                    p = urlparse(current)
+                    location = f"{p.scheme}://{p.netloc}{location}"
+                current = location
+                continue
+            return True, "ok", resp
+        return False, "too many redirects", None
+    except Exception as e:
+        return False, f"fetch error: {e}", None
 
 
 # ---------- endpoint ----------
@@ -218,40 +250,44 @@ def safe_fetch(url: str, max_redirects: int = 5):
 @app.post("/")
 async def guardrail(request: Request):
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"action": "block", "reason": "invalid json body"})
-
-    tool = body.get("tool")
-    args = body.get("arguments", {}) or {}
-
-    if tool == "read_file":
-        path = args.get("path")
-        ok, info = check_read_file(path)
-        if not ok:
-            return JSONResponse({"action": "block", "reason": info})
         try:
-            with open(info, "r", errors="replace") as f:
-                content = f.read()
-        except Exception as e:
-            return JSONResponse({"action": "block", "reason": f"read error: {e}"})
-        return JSONResponse({"action": "allow", "reason": "path within sandbox", "result": content})
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"action": "block", "reason": "invalid json body"})
 
-    elif tool == "fetch_url":
-        url = args.get("url")
-        ok, reason, _ = check_fetch_url(url)
-        if not ok:
-            return JSONResponse({"action": "block", "reason": reason})
-        ok2, reason2, resp = safe_fetch(url)
-        if not ok2:
-            return JSONResponse({"action": "block", "reason": reason2})
-        return JSONResponse({
-            "action": "allow",
-            "reason": "host allowlisted and resolves to public ip",
-            "result": resp.text[:20000],
-        })
+        tool = body.get("tool")
+        args = body.get("arguments", {}) or {}
 
-    return JSONResponse({"action": "block", "reason": "unknown tool"})
+        if tool == "read_file":
+            path = args.get("path")
+            ok, info = check_read_file(path)
+            if not ok:
+                return JSONResponse({"action": "block", "reason": info})
+            try:
+                with open(info, "r", errors="replace") as f:
+                    content = f.read()
+            except Exception as e:
+                return JSONResponse({"action": "block", "reason": f"read error: {e}"})
+            return JSONResponse({"action": "allow", "reason": "path within sandbox", "result": content})
+
+        elif tool == "fetch_url":
+            url = args.get("url")
+            ok, reason, _ = check_fetch_url(url)
+            if not ok:
+                return JSONResponse({"action": "block", "reason": reason})
+            ok2, reason2, resp = safe_fetch(url)
+            if not ok2:
+                return JSONResponse({"action": "block", "reason": reason2})
+            return JSONResponse({
+                "action": "allow",
+                "reason": "host allowlisted and resolves to public ip",
+                "result": resp.text[:20000],
+            })
+
+        return JSONResponse({"action": "block", "reason": "unknown tool"})
+    except Exception as e:
+        # Fail closed: any unexpected error blocks, never crashes/500s
+        return JSONResponse({"action": "block", "reason": f"internal error: {e}"})
 
 
 @app.get("/")
