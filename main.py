@@ -2,7 +2,6 @@ import os
 import re
 import socket
 import ipaddress
-import string
 from urllib.parse import urlparse
 
 import requests
@@ -114,8 +113,6 @@ def _has_bad_chars(s: str) -> bool:
 
 
 def normalize_host(host: str) -> str:
-    """Single source of truth for host normalization, used for both allowlist
-    checks and DNS resolution so the two can never disagree."""
     return host.strip().lower().rstrip(".")
 
 
@@ -133,9 +130,14 @@ def _is_public_ip(ip_str: str) -> bool:
         elif ip.sixtofour is not None:
             ip = ip.sixtofour
 
+    # NOTE: deliberately NOT using is_reserved here - Python's ipaddress module
+    # flags some currently-public, currently-routable IPv6 space as "reserved"
+    # based on stale IANA tables, which caused false-positive blocks of
+    # legitimate public hosts. is_private already covers loopback/link-local/
+    # RFC1918/documentation ranges for IPv4, and ULA/loopback/link-local for IPv6.
     if ip.is_private or ip.is_loopback or ip.is_link_local:
         return False
-    if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+    if ip.is_multicast or ip.is_unspecified:
         return False
     if str(ip) == "169.254.169.254":
         return False
@@ -196,8 +198,8 @@ def check_fetch_url(url):
             return False, "unparseable url", None, None
 
         scheme = (parsed.scheme or "").lower()
-        if scheme not in ("http", "https"):
-            return False, "only http/https schemes are allowed", None, None
+        if scheme != "https":
+            return False, "only https urls are accepted", None, None
 
         if "@" in (parsed.netloc or ""):
             return False, "userinfo in url not allowed", None, None
@@ -211,7 +213,7 @@ def check_fetch_url(url):
             return False, "no host in url", None, None
 
         try:
-            port = parsed.port
+            _ = parsed.port
         except Exception:
             return False, "malformed port", None, None
 
@@ -241,14 +243,6 @@ def _make_pinned_getaddrinfo(pinned_host: str, pinned_ips):
         return orig(host, port, family, type, proto, flags)
 
     return pinned
-def _upgrade_to_https(url: str) -> str:
-    try:
-        p = urlparse(url)
-        if p.scheme.lower() == "http":
-            return "https://" + url.split("://", 1)[1]
-    except Exception:
-        pass
-    return url
 
 
 def safe_fetch(url: str, max_redirects: int = 5):
@@ -281,11 +275,10 @@ def safe_fetch(url: str, max_redirects: int = 5):
                     p = urlparse(current)
                     location = f"{p.scheme}://{p.netloc}{location}"
                 elif "://" not in location:
-                    # relative redirect (no scheme, no leading slash) - resolve against current
                     p = urlparse(current)
                     base_path = p.path.rsplit("/", 1)[0]
                     location = f"{p.scheme}://{p.netloc}{base_path}/{location}"
-                current = _upgrade_to_https(location)
+                current = location
                 continue
             return True, "ok", resp
         return False, "too many redirects", None
